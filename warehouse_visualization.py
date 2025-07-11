@@ -17,6 +17,69 @@ st.set_page_config(
 
 st.title("🏭 Warehouse Training Visualization")
 
+# Define helper functions at the top
+def get_milestone_episodes():
+    """Find key milestone episodes for any training session"""
+    episode_files = [f for f in os.listdir("training_data") if f.startswith("episode_") and f.endswith(".pkl")]
+    
+    # Collect episode data
+    episode_data = []
+    for file in episode_files:
+        try:
+            file_num = int(file.split("_")[1].split(".")[0])
+            with open(f"training_data/{file}", "rb") as f:
+                data = pickle.load(f)
+            episode_data.append({
+                'episode': data['episode'],
+                'success': data.get('success', False),
+                'reward': data.get('final_reward', 0)
+            })
+        except:
+            continue
+    
+    # Sort by episode number
+    episode_data.sort(key=lambda x: x['episode'])
+    
+    # Find milestones
+    milestones = {
+        'first_attempt': 1,  # Always episode 1
+        'first_success': None,
+        'highest_reward': None,
+        'latest_success': None
+    }
+    
+    successful_episodes = [ep for ep in episode_data if ep['success']]
+    
+    if successful_episodes:
+        # First successful episode
+        milestones['first_success'] = successful_episodes[0]['episode']
+        
+        # Highest reward episode (among successful ones)
+        highest_reward_ep = max(successful_episodes, key=lambda x: x['reward'])
+        milestones['highest_reward'] = highest_reward_ep['episode']
+        
+        # Latest successful episode
+        milestones['latest_success'] = successful_episodes[-1]['episode']
+    
+    return milestones
+
+def get_successful_episodes():
+    """Get list of all successful episodes (for timeline)"""
+    successful_episodes = []
+    episode_files = [f for f in os.listdir("training_data") if f.startswith("episode_") and f.endswith(".pkl")]
+    
+    for file in episode_files:
+        try:
+            file_num = int(file.split("_")[1].split(".")[0])
+            with open(f"training_data/{file}", "rb") as f:
+                data = pickle.load(f)
+            if data.get('success', False):
+                successful_episodes.append(data['episode'])
+        except:
+            continue
+    
+    return sorted(successful_episodes)
+
 # Initialize session state for unique keys and animation control
 if 'refresh_time' not in st.session_state:
     st.session_state.refresh_time = int(time.time())
@@ -45,30 +108,202 @@ if auto_refresh:
     refresh_interval = st.sidebar.slider("Refresh interval (seconds)", 1, 10, 2)
     # Add auto-refresh placeholder
     placeholder = st.empty()
-    
-# Episode selection
+
+# Episode selection - FIXED to only show current training session episodes
 episode_files = [f for f in os.listdir("training_data") if f.startswith("episode_") and f.endswith(".pkl")]
 episode_numbers = [int(f.split("_")[1].split(".")[0]) for f in episode_files]
+
+# FIXED: Use session range from progress.json for accurate filtering
+current_episode = progress.get('current_episode', 0)
+session_start = progress.get('session_start_episode', 1)
+session_episodes = progress.get('total_episodes', 0)
+
+if current_episode > 0:
+    # Filter episodes to only show those from current training session
+    episode_numbers = [ep for ep in episode_numbers if session_start <= ep <= current_episode]
+
 episode_numbers.sort()
 
 if episode_numbers:
-    # Show actual file numbers that match episode data exactly
-    # No conversion needed - dropdown number = file number = episode number
-    display_options = ["Latest"] + [f"Episode {num + 1}" for num in episode_numbers]  # +1 because files are 0-indexed
+    # Get dynamic milestone episodes for this training session FIRST
+    milestones = get_milestone_episodes()
     
+    # Show most recent episodes for better usability (max 300 episodes)
+    if len(episode_numbers) > 300:
+        # Show first 50, middle 100, last 150 episodes for better navigation
+        middle_start = len(episode_numbers) // 2 - 50
+        middle_end = len(episode_numbers) // 2 + 50
+        recent_episodes = (episode_numbers[:50] + 
+                          episode_numbers[middle_start:middle_end] + 
+                          episode_numbers[-150:])
+        
+        # ALWAYS include milestone episodes (critical fix!)
+        milestone_numbers = [ep for ep in milestones.values() if ep and ep in episode_numbers]
+        recent_episodes.extend(milestone_numbers)
+        
+        episode_numbers = sorted(list(set(recent_episodes)))
+    
+    # Add milestone episodes for easy access
+    milestone_episodes = []
+    
+    # Always include episode 1
+    if 1 in episode_numbers:
+        milestone_episodes.append(1)
+    
+    # Add dynamic milestones if they exist and are in current session
+    for milestone_type, ep_num in milestones.items():
+        if ep_num and ep_num in episode_numbers and ep_num not in milestone_episodes:
+            milestone_episodes.append(ep_num)
+    
+    # Combine milestones with regular episodes, removing duplicates
+    milestone_episodes.sort()
+    remaining_episodes = [ep for ep in episode_numbers if ep not in milestone_episodes]
+    
+    # Create organized display options with key episodes at the top
+    display_options = ["Latest"]
+    
+    # Add milestone episodes with descriptive labels
+    if milestone_episodes:
+        for ep in milestone_episodes:
+            if ep == milestones['first_attempt']:
+                display_options.append(f"Episode {ep} - Very First Attempt")
+            elif ep == milestones['first_success']:
+                display_options.append(f"Episode {ep} - 🎉 FIRST SUCCESS!")
+            elif ep == milestones['highest_reward']:
+                display_options.append(f"Episode {ep} - 🏆 HIGHEST REWARD!")
+            elif ep == milestones['latest_success']:
+                display_options.append(f"Episode {ep} - 🎯 LATEST SUCCESS!")
+            else:
+                display_options.append(f"Episode {ep}")
+    
+    # Add remaining episodes (without special labels)
+    if remaining_episodes:
+        display_options.extend([f"Episode {num}" for num in remaining_episodes])
+    
+    selectable_options = display_options
+    
+    # Add interactive milestone buttons
+    st.sidebar.markdown("### 🎯 **Key Milestones**")
+    
+    # Initialize session state for selected episode if not exists
+    if 'selected_episode_number' not in st.session_state:
+        st.session_state.selected_episode_number = None
+    if 'button_clicked' not in st.session_state:
+        st.session_state.button_clicked = False
+    if 'persistent_episode_selection' not in st.session_state:
+        st.session_state.persistent_episode_selection = None
+    
+    # Single row layout for buttons in sidebar with persistent selection
+    if st.sidebar.button("🤖 First Attempt", key="btn_first", help=f"Episode {milestones['first_attempt']} - Very first attempt", use_container_width=True):
+        st.session_state.persistent_episode_selection = milestones['first_attempt']
+        st.session_state.selected_episode_number = milestones['first_attempt']
+        st.session_state.button_clicked = True
+    
+    if milestones['first_success'] and st.sidebar.button("🎉 First Success", key="btn_success", help=f"Episode {milestones['first_success']} - First successful delivery", use_container_width=True):
+        st.session_state.persistent_episode_selection = milestones['first_success']
+        st.session_state.selected_episode_number = milestones['first_success']
+        st.session_state.button_clicked = True
+    
+    if milestones['highest_reward'] and st.sidebar.button("🏆 Best Reward", key="btn_highest", help=f"Episode {milestones['highest_reward']} - Highest reward achieved", use_container_width=True):
+        st.session_state.persistent_episode_selection = milestones['highest_reward']
+        st.session_state.selected_episode_number = milestones['highest_reward']
+        st.session_state.button_clicked = True
+    
+    if milestones['latest_success'] and st.sidebar.button("🎯 Latest Success", key="btn_latest", help=f"Episode {milestones['latest_success']} - Most recent success", use_container_width=True):
+        st.session_state.persistent_episode_selection = milestones['latest_success']
+        st.session_state.selected_episode_number = milestones['latest_success']
+        st.session_state.button_clicked = True
+    
+    # Show detected milestones summary with availability check and debugging
+    st.sidebar.markdown("**Detected Episodes:**")
+    milestone_summary = []
+    if milestones['first_attempt']:
+        available = "✅" if milestones['first_attempt'] in episode_numbers else "❌"
+        milestone_summary.append(f"First: {milestones['first_attempt']}{available}")
+    if milestones['first_success']:
+        available = "✅" if milestones['first_success'] in episode_numbers else "❌"
+        milestone_summary.append(f"Success: {milestones['first_success']}{available}")
+    if milestones['highest_reward']:
+        available = "✅" if milestones['highest_reward'] in episode_numbers else "❌"
+        milestone_summary.append(f"Best: {milestones['highest_reward']}{available}")
+    if milestones['latest_success']:
+        available = "✅" if milestones['latest_success'] in episode_numbers else "❌"
+        milestone_summary.append(f"Latest: {milestones['latest_success']}{available}")
+    
+    if milestone_summary:
+        st.sidebar.markdown(f"*{' | '.join(milestone_summary)}*")
+    
+    # Handle button selections and persistent episode choice
+    default_index = 0
+    
+    # Check if we have a persistent episode selection to maintain
+    if st.session_state.get('persistent_episode_selection'):
+        target_episode = st.session_state.persistent_episode_selection
+        
+        # Find the display option that matches the persistent episode
+        for option in selectable_options:
+            if option != "Latest":
+                try:
+                    # Handle both "Episode X" and "Episode X - Description" formats
+                    if " - " in option:
+                        episode_part = option.split(" - ")[0]  # Get "Episode X" part
+                    else:
+                        episode_part = option  # Already just "Episode X"
+                    
+                    ep_num = int(episode_part.split()[1])  # Extract number
+                    if ep_num == target_episode:
+                        try:
+                            default_index = selectable_options.index(option)
+                            break
+                        except ValueError:
+                            default_index = 0
+                except (IndexError, ValueError):
+                    continue
+    
+    # Clear the temporary selection state (but keep persistent)
+    if st.session_state.get('button_clicked'):
+        st.session_state.selected_episode_number = None
+        st.session_state.button_clicked = False
+
     selected_display = st.sidebar.selectbox(
         "Select Episode", 
-        display_options,
-        index=0
+        selectable_options,
+        index=default_index,
+        help="Choose any episode to see the robot's behavior at that stage!",
+        key="episode_selectbox"
     )
+    
+    # Check if user manually changed the dropdown (override button selection)
+    if st.session_state.get('persistent_episode_selection'):
+        # Extract episode number from current selection
+        current_episode = None
+        if selected_display == "Latest":
+            current_episode = "Latest"
+        else:
+            try:
+                episode_part = selected_display.split(" - ")[0]
+                current_episode = int(episode_part.split()[1])
+            except (IndexError, ValueError):
+                current_episode = "Latest"
+        
+        # If user manually selected something different, clear persistent selection
+        if current_episode != st.session_state.persistent_episode_selection and current_episode != "Latest":
+            st.session_state.persistent_episode_selection = None
     
     # Convert display selection back to file number for loading
     if selected_display == "Latest":
         selected_episode = "Latest"
+    elif selected_display.startswith("───"):
+        # Skip separator lines - this shouldn't happen but just in case
+        selected_episode = "Latest"
     else:
-        # Extract episode number from "Episode 787" format  
-        displayed_num = int(selected_display.split()[1])
-        selected_episode = displayed_num  # Direct mapping: Episode 787 → episode_787.pkl
+        # Extract episode number from formats like "Episode 59 - 🎉 FIRST SUCCESS!"
+        try:
+            episode_part = selected_display.split(" - ")[0]  # Get "Episode 59" part
+            selected_episode = int(episode_part.split()[1])  # Extract number
+        except (IndexError, ValueError):
+            # Fallback to original method
+            selected_episode = int(selected_display.split()[1])
 else:
     st.sidebar.warning("No episode data found")
     st.stop()
@@ -81,7 +316,10 @@ col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.metric("Current Episode", progress["current_episode"])
 with col2:
-    st.metric("Total Episodes", progress["total_episodes"])
+    # FIXED: Show both session episodes and current episode number clearly
+    session_episodes = progress.get("total_episodes", 0)
+    session_start = progress.get("session_start_episode", 1)
+    st.metric("Session Episodes", f"{session_episodes} (#{session_start}-{progress['current_episode']})")
 with col3:
     st.metric("Latest Reward", f"{progress['latest_reward']:.1f}")
 with col4:
@@ -91,60 +329,70 @@ with col4:
 st.markdown("---")
 st.markdown("## 🎯 **Learning Timeline Reference**")
 
-# Dynamically load successful episodes from training data
-def get_successful_episodes():
-    successful_episodes = []
-    episode_files = [f for f in os.listdir("training_data") if f.startswith("episode_") and f.endswith(".pkl")]
+# Get successful episodes for timeline display
+
+# Get actual successful episodes from current training
+successful_episodes = get_successful_episodes()
+
+# FIXED: Use session range for accurate filtering  
+current_episode = progress.get('current_episode', 0)
+session_start = progress.get('session_start_episode', 1)
+session_episodes = progress.get('total_episodes', 0)
+
+if current_episode > 0:
+    # Filter out episodes beyond current training session range
+    successful_episodes = [ep for ep in successful_episodes if session_start <= ep <= current_episode]
+
+# Create FOCUSED timeline with key milestones only
+if len(successful_episodes) == 0:
+    # CLEAN START - No successes yet in current training
+    if session_episodes < 10:
+        timeline_text = "🚀 **Training Starting...** \n\nKey milestone episodes will appear here as training progresses."
+    elif session_episodes < 100:
+        timeline_text = f"📚 **Early Training** ({session_episodes} episodes completed)\n\nKey milestone episodes will appear here when achieved."
+    else:
+        timeline_text = f"📚 **Learning in Progress** ({session_episodes} episodes completed)\n\nNo successful deliveries yet in this training session - keep training!"
+else:
+    # MILESTONE-FOCUSED SUCCESS LIST - Show only key episodes
+    timeline_text = f"🎯 **Key Training Milestones** ({len(successful_episodes)} total successes):\n\n"
     
+    # Get episode rewards for finding highest reward
+    episode_rewards = {}
+    episode_files = [f for f in os.listdir("training_data") if f.startswith("episode_") and f.endswith(".pkl")]
     for file in episode_files:
         try:
             file_num = int(file.split("_")[1].split(".")[0])
             with open(f"training_data/{file}", "rb") as f:
                 data = pickle.load(f)
-            if data.get('success', False):
-                successful_episodes.append(data['episode'])
+            if data.get('success', False) and data['episode'] in successful_episodes:
+                episode_rewards[data['episode']] = data.get('final_reward', 0)
         except:
             continue
     
-    return sorted(successful_episodes)
-
-# Get actual successful episodes from current training
-successful_episodes = get_successful_episodes()
-
-# CRITICAL FIX: Only show episodes from current training session
-current_training_episodes = progress.get('total_episodes', 0)
-if current_training_episodes > 0:
-    # Filter out episodes beyond current training - these are from old sessions
-    successful_episodes = [ep for ep in successful_episodes if ep <= current_training_episodes]
-
-# Create clean, progressive timeline
-if len(successful_episodes) == 0:
-    # CLEAN START - No successes yet in current training
-    if current_training_episodes < 10:
-        timeline_text = "🚀 **Training Starting...** \n\nSuccessful delivery episodes will appear here as training progresses."
-    elif current_training_episodes < 100:
-        timeline_text = f"📚 **Early Training** ({current_training_episodes} episodes completed)\n\nSuccessful delivery episodes will appear here when achieved."
-    else:
-        timeline_text = f"📚 **Learning in Progress** ({current_training_episodes} episodes completed)\n\nNo successful deliveries yet in this training session - keep training!"
-else:
-    # PROGRESSIVE SUCCESS LIST - Show each success as it happens  
-    timeline_text = f"🎯 **Successful Delivery Episodes** ({len(successful_episodes)} total in current training):\n\n"
+    # Find key episodes
+    first_success = successful_episodes[0] if successful_episodes else None
+    last_success = successful_episodes[-1] if successful_episodes else None
+    highest_reward_episode = max(episode_rewards.keys(), key=lambda x: episode_rewards[x]) if episode_rewards else None
     
-    for i, episode in enumerate(successful_episodes, 1):
-        if i == 1:
-            timeline_text += f"🎉 **Episode {episode}** - First successful delivery!\n"
-        else:
-            ordinals = ['Second', 'Third', 'Fourth', 'Fifth', 'Sixth', 'Seventh', 'Eighth', 'Ninth', 'Tenth']
-            ordinal = ordinals[min(i-2, 8)] if i <= 10 else f"{i}th"
-            timeline_text += f"🎯 **Episode {episode}** - {ordinal} delivery\n"
+    # Show key milestones
+    if first_success:
+        timeline_text += f"🎉 **Episode {first_success}** - First successful delivery breakthrough!\n"
+    
+    if highest_reward_episode and highest_reward_episode != first_success:
+        reward_value = episode_rewards[highest_reward_episode]
+        timeline_text += f"🏆 **Episode {highest_reward_episode}** - Highest reward achieved ({reward_value:.1f})\n"
+    
+    if last_success and last_success != first_success and last_success != highest_reward_episode:
+        timeline_text += f"🎯 **Episode {last_success}** - Most recent successful delivery\n"
     
     timeline_text += f"\n📊 **Current Training Progress:**\n"
-    timeline_text += f"- Total Episodes: {current_training_episodes}\n"
-    timeline_text += f"- Success Rate: {len(successful_episodes)/max(current_training_episodes, 1)*100:.1f}%\n"
-    timeline_text += f"\n💡 *Click any episode number above in the dropdown to view its animation!*"
+    timeline_text += f"- Session Episodes: {session_episodes} (#{session_start}-{current_episode})\n"
+    timeline_text += f"- Total Successes: {len(successful_episodes)}\n"
+    timeline_text += f"- Success Rate: {len(successful_episodes)/max(session_episodes, 1)*100:.1f}%\n"
+    timeline_text += f"\n💡 *Click any milestone episode number above in the dropdown to view its animation!*"
 
 st.markdown(timeline_text)
-st.markdown("*Note: Only episodes from current training session (≤ Episode {}) are shown here.*".format(current_training_episodes) if current_training_episodes > 0 else "*Note: Timeline shows current training session progress.*")
+st.markdown("*Note: Only episodes from current training session (#{}-{}) are shown here.*".format(session_start, current_episode) if current_episode > 0 else "*Note: Timeline shows current training session progress.*")
 st.markdown("---")
 
 # Function to load episode data
