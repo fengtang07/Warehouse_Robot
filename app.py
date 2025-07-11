@@ -3,6 +3,7 @@ import mlflow
 import plotly.express as px
 import pandas as pd
 from PIL import Image
+import time
 
 st.set_page_config(layout="wide", page_title="Warehouse MLOps Dashboard")
 
@@ -22,29 +23,67 @@ if page == "Training Visualization":
 
 st.title("Warehouse Digital Twin - MLOps Dashboard")
 
+# Auto-refresh controls
+col1, col2 = st.columns([3, 1])
+with col1:
+    auto_refresh = st.checkbox("🔄 Auto-refresh (10s)", value=False)
+with col2:
+    if st.button("🔄 Refresh Now"):
+        st.rerun()
+
+if auto_refresh:
+    time.sleep(10)
+    st.rerun()
+
 # MLflow connection with proxy bypass
 import os
 os.environ['NO_PROXY'] = '127.0.0.1,localhost'
 os.environ['no_proxy'] = '127.0.0.1,localhost'
 
-mlflow_tracking_uri = "http://127.0.0.1:5000"
+mlflow_tracking_uri = "http://127.0.0.1:5001"
 # Set tracking URI globally for MLflow
 mlflow.set_tracking_uri(mlflow_tracking_uri)
 client = mlflow.tracking.MlflowClient(tracking_uri=mlflow_tracking_uri)
 
 # Sidebar for experiment selection
+st.sidebar.markdown("## 🔍 Connection Status")
+
 try:
+    # Test basic MLflow connection
     experiments = client.search_experiments()
+    st.sidebar.success(f"✅ MLflow Connected: {len(experiments)} experiments found")
+    
+    # Debug information
+    st.sidebar.markdown("**Debug Info:**")
+    st.sidebar.code(f"MLflow URI: {mlflow_tracking_uri}")
+    st.sidebar.code(f"Experiments: {[exp.name for exp in experiments]}")
+    
     experiment_names = [exp.name for exp in experiments]
     if experiment_names:
         selected_experiment_name = st.sidebar.selectbox("Select Experiment", experiment_names)
         selected_experiment = client.get_experiment_by_name(selected_experiment_name)
+        
+        # Show experiment details
+        if selected_experiment:
+            st.sidebar.info(f"Experiment ID: {selected_experiment.experiment_id}")
     else:
         selected_experiment = None
-        st.sidebar.warning("No experiments found. Please create an experiment first.")
+        st.sidebar.warning("No experiments found. Please run training first to create experiments.")
+        st.sidebar.markdown("**Expected experiments:**")
+        st.sidebar.markdown("- `Warehouse_PPO_Adaptive_Learning`")
+        st.sidebar.markdown("- `Warehouse_Smart_Learning`")
+        st.sidebar.markdown("- `Warehouse_PPO_Learning`")
+        
 except Exception as e:
-    st.sidebar.error(f"Could not connect to MLflow server: {str(e)}")
-    st.sidebar.info("Please ensure MLflow server is running at http://127.0.0.1:5000")
+    st.sidebar.error(f"❌ MLflow Connection Failed")
+    st.sidebar.error(f"Error: {str(e)}")
+    st.sidebar.markdown("**Troubleshooting:**")
+    st.sidebar.markdown("1. Start MLflow server:")
+    st.sidebar.code("mlflow server --host 0.0.0.0 --port 5001 --backend-store-uri file:./mlruns")
+    st.sidebar.markdown("2. Check if server is running:")
+    st.sidebar.code("curl http://127.0.0.1:5001/health")
+    st.sidebar.markdown("3. Run training to create experiments:")
+    st.sidebar.code("python new_train.py")
     selected_experiment = None
 
 # Main dashboard content
