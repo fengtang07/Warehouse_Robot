@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""
+Warehouse training with ADVANCED PPO. This script incorporates Generalized
+Advantage Estimation (GAE) and an automatic stopping condition.
+"""
+import os
+import time
+import json
+import pickle
+import torch
+import torch.nn as nn
+from torch.distributions import Normal
+import numpy as np
+import mlflow
+from datetime import datetime
+from collections import deque
+
+# Set proxy bypass for MLflow connection
+os.environ['NO_PROXY'] = '127.0.0.1,localhost'
+os.environ['no_proxy'] = '127.0.0.1,localhost'
+
+
+# ################################## PPO Agent and Network ###################################
+
+class Memory:
+    """A buffer for storing trajectories experienced by a PPO agent."""
+    def __init__(self):
+        self.actions = []
+        self.states = []
+        self.logprobs = []
+        self.rewards = []
+        self.is_terminals = []
+        self.values = [] # For GAE
+
+    def clear_memory(self):
+        del self.actions[:]
+        del self.states[:]
+        del self.logprobs[:]
+        del self.rewards[:]
+        del self.is_terminals[:]
+        del self.values[:]
+
+class ActorCritic(nn.Module):
+    """An Actor-Critic network with shared layers for the PPO agent."""
+    def __init__(self, state_dim, action_dim, action_std_init):
+        super(ActorCritic, self).__init__()
+        self.action_dim = action_dim
+        self.action_var = torch.full((self.action_dim,), action_std_init * action_std_init)
+
+        # Actor network
+        self.actor = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.Tanh(),
+            nn.Linear(256, 128),
+            nn.Tanh(),
+            nn.Linear(128, self.action_dim),
+            nn.Tanh()
+        )
+
+        # Critic network
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.Tanh(),
+            nn.Linear(256, 128),
+            nn.Tanh(),
+            nn.Linear(128, 1)
+        )
+
+    def set_action_std(self, new_action_std):
+        self.action_var = torch.full((self.action_dim,), new_action_std * new_action_std)
+
+    def forward(self):
+        raise NotImplementedError
+
+    def act(self, state):
+        action_mean = self.actor(state)
+        action_std = torch.sqrt(self.action_var)
+        dist = Normal(action_mean, action_std)
+        action = dist.sample()
+        action_logprob = dist.log_prob(action)
+        state_val = self.critic(state)
+        return action.detach(), action_logprob.detach(), state_val.detach()
+
+    def evaluate(self, state, action):
+        action_mean = self.actor(state)
+        action_var = self.action_var.expand_as(action_mean)
+        action_std = torch.sqrt(action_var)
+        dist = Normal(action_mean, action_std)
+        action_logprobs = dist.log_prob(action).sum(dim=-1)
+        dist_entropy = dist.entropy().sum(dim=-1)
+        state_values = self.critic(state)
+        return state_values, action_logprobs, dist_entropy
+
+
+class PPO:
+    """The Advanced PPO agent with GAE."""
+    def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, gae_lambda, entropy_coef, action_std_init=0.6):
+        self.action_std = action_std_init
+        self.gamma = gamma
+        self.eps_clip = eps_clip
+        self.K_epochs = K_epochs
+        self.gae_lambda = gae_lambda
+        self.entropy_coef = entropy_coef
+
+        self.policy = ActorCritic(state_dim, action_dim, action_std_init)
+        self.optimizer = torch.optim.Adam([
+            {'params': self.policy.actor.parameters(), 'lr': lr_actor},
+            {'params': self.policy.critic.parameters(), 'lr': lr_critic}
+        ])
+        self.policy_old = ActorCritic(state_dim, action_dim, action_std_init)
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        self.MseLoss = nn.MSELoss()
+
+    def set_action_std(self, new_action_std):
+        self.action_std = new_action_std
+        self.policy.set_action_std(new_action_std)
+        self.policy_old.set_action_std(new_action_std)
+
+    def decay_action_std(self, action_std_decay_rate, min_action_std):
+        self.action_std = max(self.action_std - action_std_decay_rate, min_action_std)
+        self.set_action_std(self.action_std)
+
+    def select_action(self, state):
+        with torch.no_grad():
+            state = torch.FloatTensor(state)
+            action, action_logprob, state_val = self.policy_old.act(state)
+        return action.numpy().flatten(), action_logprob.sum().numpy(), state_val.numpy()
+
+    def update(self, memory):
+        # GAE Calculation
+        advantages = []
+        last_advantage = 0
+        with torch.no_grad():
+            last_value = self.policy_old.critic(torch.FloatTensor(memory.states[-1])).detach().item() if not memory.is_terminals[-1] else 0
+        
+        for i in reversed(range(len(memory.rewards))):
+            mask = 1.0 - memory.is_terminals[i]
+            value = memory.values[i]
+            next_value = last_value if (i + 1) == len(memory.rewards) else memory.values[i + 1]
+            delta = memory.rewards[i] + self.gamma * next_value * mask - value
+            last_advantage = delta + self.gamma * self.gae_lambda * last_advantage * mask
+            advantages.insert(0, last_advantage)
+        
+        advantages = torch.tensor(advantages, dtype=torch.float32)
+        values_tensor = torch.squeeze(torch.stack(memory.values, dim=0)).detach()
+        rewards = advantages + values_tensor
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
+
+        old_states = torch.squeeze(torch.stack(memory.states, dim=0)).detach()
+        old_actions = torch.squeeze(torch.stack(memory.actions, dim=0)).detach()
+        old_logprobs = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach()
+
+        for _ in range(self.K_epochs):
+            state_values, logprobs, dist_entropy = self.policy.evaluate(old_states, old_actions)
+            state_values = torch.squeeze(state_values)
+            ratios = torch.exp(logprobs - old_logprobs)
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+            actor_loss = -torch.min(surr1, surr2).mean()
+            critic_loss = self.MseLoss(state_values, rewards)
+            entropy_loss = -self.entropy_coef * dist_entropy.mean()
+            loss = actor_loss + 0.5 * critic_loss + entropy_loss
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+            self.optimizer.step()
+
+        self.policy_old.load_state_dict(self.policy.state_dict())
+
+
+# ################################## Warehouse Environment ###################################
+class SmartWarehouseEnv:
+    """Enhanced warehouse environment with smart rewards and state representation."""
+    def __init__(self):
+        self.state_dim = 23
+        self.action_dim = 2
+        self.max_steps = 800
+        self.current_step = 0
+        self.agent_pos = np.array([0.0, 0.0])
+        self.agent_angle = 0.0
+        self.agent_vel = np.array([0.0, 0.0])
+        self.package_pos = np.array([0.0, 2.0])
+        self.delivery_pos = np.array([5.0, 5.0])
+        self.has_package = False
+        self.obstacles = [
+            np.array([3.0, 2.0]), np.array([-3.0, -2.0]),
+            np.array([1.0, 4.0]), np.array([-1.0, -4.0])
+        ]
+        self.position_history = []
+        self.episode_data = []
+        self.last_distance_to_package = None
+        self.last_distance_to_delivery = None
+        self.delivered_successfully = False
+
+    def reset(self):
+        self.current_step = 0
+        self.agent_pos = np.array([0.0, 0.0])
+        self.agent_angle = np.random.uniform(0, 2 * np.pi)
+        self.agent_vel = np.array([0.0, 0.0])
+        self.package_pos = np.array([np.random.uniform(-2, 2), np.random.uniform(1, 4)])
+        self.has_package = False
+        self.position_history = []
+        self.delivered_successfully = False
+        self.last_distance_to_package = np.linalg.norm(self.agent_pos - self.package_pos)
+        self.last_distance_to_delivery = np.linalg.norm(self.agent_pos - self.delivery_pos)
+        return self._get_observation()
+
+    def _get_observation(self):
+        obs = [
+            self.agent_pos[0], self.agent_pos[1], np.cos(self.agent_angle), np.sin(self.agent_angle),
+            self.agent_vel[0], self.agent_vel[1], self.package_pos[0],
+            self.package_pos[1], float(self.has_package), self.delivery_pos[0],
+            self.delivery_pos[1]
+        ]
+        if not self.has_package:
+            dist_to_package = np.linalg.norm(self.agent_pos - self.package_pos)
+            direction = (self.package_pos - self.agent_pos) / (dist_to_package + 1e-5)
+            obs.extend([dist_to_package, 0.0])
+        else:
+            dist_to_delivery = np.linalg.norm(self.agent_pos - self.delivery_pos)
+            direction = (self.delivery_pos - self.agent_pos) / (dist_to_delivery + 1e-5)
+            obs.extend([0.0, dist_to_delivery])
+        obs.extend([direction[0], direction[1]])
+        directions = np.array([[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]])
+        for dir_vec in directions:
+            min_dist = 10.0
+            for obs_pos in self.obstacles:
+                to_obstacle = obs_pos - self.agent_pos
+                proj = np.dot(to_obstacle, dir_vec)
+                if proj > 0:
+                    cross_dist = np.linalg.norm(to_obstacle - proj * dir_vec)
+                    if cross_dist < 0.5:
+                        min_dist = min(min_dist, proj)
+            obs.append(min(min_dist / 10.0, 1.0))
+        return np.array(obs, dtype=np.float32)
+
+    def step(self, action):
+        self.current_step += 1
+        left_vel, right_vel = np.clip(action, -1, 1)
+        v = (left_vel + right_vel) / 2.0
+        omega = (right_vel - left_vel) / 0.5
+        dt = 0.1
+        self.agent_angle += omega * dt
+        self.agent_pos[0] += v * np.cos(self.agent_angle) * dt
+        self.agent_pos[1] += v * np.sin(self.agent_angle) * dt
+        self.agent_vel = np.array([v, omega])
+        self.position_history.append({
+            'step': self.current_step, 'agent_pos': self.agent_pos.copy(),
+            'agent_angle': self.agent_angle, 'package_pos': self.package_pos.copy(),
+            'has_package': self.has_package, 'timestamp': time.time()
+        })
+        reward, done = self._calculate_smart_reward()
+        return self._get_observation(), reward, done, {}
+
+    def _calculate_smart_reward(self):
+        reward, done = -0.05, False
+        if abs(self.agent_vel[1]) > 0.8 and abs(self.agent_vel[0]) < 0.1: reward -= 0.1
+        if not self.has_package:
+            dist_to_package = np.linalg.norm(self.agent_pos - self.package_pos)
+            reward += (self.last_distance_to_package - dist_to_package) * 10
+            self.last_distance_to_package = dist_to_package
+            if dist_to_package < 0.3:
+                self.has_package = True
+                reward += 100
+                self.last_distance_to_delivery = np.linalg.norm(self.agent_pos - self.delivery_pos)
+        else:
+            dist_to_delivery = np.linalg.norm(self.agent_pos - self.delivery_pos)
+            reward += (self.last_distance_to_delivery - dist_to_delivery) * 50
+            self.last_distance_to_delivery = dist_to_delivery
+            if dist_to_delivery < 0.5:
+                reward += 1000 + 100 * (self.max_steps - self.current_step) / self.max_steps
+                self.delivered_successfully = True
+                done = True
+        for obs in self.obstacles:
+            if np.linalg.norm(self.agent_pos - obs) < 0.6:
+                reward -= 50
+                done = True
+                break
+        if self.current_step >= self.max_steps:
+            done = True
+            reward -= 100
+        return reward, done
+
+    def save_episode_data(self, episode_num, reward, success):
+        # FIXED: Improved compatibility with visualization script
+        episode_info = {
+            'episode': episode_num, 'positions': self.position_history.copy(),
+            'final_reward': reward, 'success': success,
+            'obstacles': [o.tolist() for o in self.obstacles],
+            'delivery_pos': self.delivery_pos.tolist()
+        }
+        
+        # Ensure episode_data list exists and track all episodes properly
+        if not hasattr(self, 'episode_data'):
+            self.episode_data = []
+        self.episode_data.append(episode_info)
+        
+        # Create training_data directory
+        os.makedirs("training_data", exist_ok=True)
+        
+        # Save individual episode file
+        with open(f"training_data/episode_{episode_num}.pkl", "wb") as f: 
+            pickle.dump(episode_info, f)
+        
+        # Save latest episode file
+        with open("training_data/latest_episode.pkl", "wb") as f: 
+            pickle.dump(episode_info, f)
+        
+        # FIXED: Calculate success rate from all episodes in current session
+        session_episodes = len(self.episode_data)
+        session_successes = sum(ep['success'] for ep in self.episode_data)
+        session_success_rate = session_successes / session_episodes if session_episodes > 0 else 0.0
+        
+        # FIXED: Progress tracking that matches visualization expectations
+        progress = {
+            'current_episode': episode_num,        # Actual episode number being saved
+            'total_episodes': session_episodes,    # Episodes in current training session
+            'latest_reward': reward, 
+            'success_rate': session_success_rate,
+            'session_start_episode': episode_num - session_episodes + 1  # For reference
+        }
+        
+        # Save progress file
+        with open("training_data/progress.json", "w") as f: 
+            json.dump(progress, f)
+
+# ################################## Main Training Function ###################################
+def train_ppo_agent():
+    """Main training function with stabilized PPO and adaptive exploration."""
+    print("🧠 Starting Warehouse Agent Training with ADVANCED PPO (GAE)...")
+    print("=" * 60)
+
+    # --- TEST MODE: Clean up old training data for fresh start ---
+    print("🧹 TEST MODE: Cleaning up old training data...")
+    if os.path.exists("training_data"):
+        # Backup critical files before cleanup
+        backup_files = ["progress.json", "latest_episode.pkl"]
+        for backup_file in backup_files:
+            if os.path.exists(f"training_data/{backup_file}"):
+                os.rename(f"training_data/{backup_file}", f"training_data/{backup_file}.backup")
+        
+        # Remove all episode files for fresh start
+        import glob
+        episode_files = glob.glob("training_data/episode_*.pkl")
+        for file in episode_files:
+            try:
+                os.remove(file)
+            except OSError:
+                pass
+        
+        print(f"🗑️ Removed {len(episode_files)} old episode files")
+        print("✨ Starting fresh training session...")
+    else:
+        print("📁 Creating new training_data directory...")
+        
+    os.makedirs("training_data", exist_ok=True)
+
+    # --- FIXED: Check for existing episodes to continue training ---
+    starting_episode = 1
+    episode_files = [f for f in os.listdir("training_data") if f.startswith("episode_") and f.endswith(".pkl")]
+    if episode_files:
+        episode_numbers = [int(f.split("_")[1].split(".")[0]) for f in episode_files]
+        starting_episode = max(episode_numbers) + 1
+        print(f"📂 Found existing training data. Continuing from episode {starting_episode}")
+    else:
+        print("🆕 Starting fresh training session from episode 1")
+
+    # --- Hyperparameters ---
+    env = SmartWarehouseEnv()
+    total_training_timesteps = int(3e6)
+    action_std_init = 0.6
+    action_std_decay_rate = 0.0025
+    min_action_std = 0.1
+    update_timestep = 4096
+    K_epochs = 80
+    eps_clip = 0.2
+    gamma = 0.99
+    lr_actor = 1e-4
+    lr_critic = 3e-4
+    gae_lambda = 0.95
+    entropy_coef = 0.01
+
+    # --- Early Stopping Parameters ---
+    min_success_rate_for_stop = 0.95
+    stop_patience = 300 # Number of episodes to average over
+
+    # --- Initialization ---
+    ppo_agent = PPO(env.state_dim, env.action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, gae_lambda, entropy_coef, action_std_init)
+    memory = Memory()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(ppo_agent.optimizer, T_max=total_training_timesteps // update_timestep, eta_min=1e-6)
+
+    # --- Adaptive Exploration ---
+    stagnation_window = 150
+    success_history = deque(maxlen=stagnation_window)
+    stop_history = deque(maxlen=stop_patience) # For early stopping
+    best_success_rate = 0.0
+    stagnation_counter = 0
+    
+    start_time = datetime.now().replace(microsecond=0)
+    print(f"🚀 Training started at {start_time}")
+    time_step, i_episode = 0, starting_episode - 1  # FIXED: Start from correct episode number
+    
+    # --- MLflow Configuration ---
+    mlflow.set_tracking_uri("http://127.0.0.1:5001")
+    
+    # --- Training Loop ---
+    with mlflow.start_run():
+        mlflow.log_params({
+            "algorithm": "PPO_GAE_Adaptive_EarlyStop", "total_training_timesteps": total_training_timesteps,
+            "lr_actor": lr_actor, "lr_critic": lr_critic, "gamma": gamma, "K_epochs": K_epochs,
+            "update_timestep": update_timestep, "eps_clip": eps_clip, "action_std_init": action_std_init,
+            "stagnation_window": stagnation_window, "gae_lambda": gae_lambda, "entropy_coef": entropy_coef,
+            "stop_patience": stop_patience, "min_success_rate_for_stop": min_success_rate_for_stop,
+            "starting_episode": starting_episode  # FIXED: Log starting episode
+        })
+
+        while time_step <= total_training_timesteps:
+            i_episode += 1
+            state = env.reset()
+            current_ep_reward = 0
+            
+            for t in range(1, env.max_steps + 1):
+                action, log_prob, value = ppo_agent.select_action(state)
+                next_state, reward, done, _ = env.step(action)
+                
+                memory.states.append(torch.FloatTensor(state))
+                memory.actions.append(torch.from_numpy(action))
+                memory.logprobs.append(torch.from_numpy(log_prob))
+                memory.rewards.append(reward)
+                memory.is_terminals.append(done)
+                memory.values.append(torch.tensor(value).flatten())
+
+                time_step += 1
+                current_ep_reward += reward
+
+                if len(memory.states) >= update_timestep:
+                    ppo_agent.update(memory)
+                    memory.clear_memory()
+                    scheduler.step()
+
+                if time_step % 5000 == 0:
+                    ppo_agent.decay_action_std(action_std_decay_rate, min_action_std)
+
+                state = next_state
+                if done: break
+            
+            success_history.append(1 if env.delivered_successfully else 0)
+            stop_history.append(1 if env.delivered_successfully else 0)
+            
+            # --- Early Stopping Check ---
+            if len(stop_history) == stop_patience and np.mean(stop_history) >= min_success_rate_for_stop:
+                print(f"\n✅ Convergence achieved! Average success rate over last {stop_patience} episodes is {np.mean(stop_history):.2%}.")
+                break
+
+            # --- Adaptive Exploration Check ---
+            if i_episode > 0 and i_episode % stagnation_window == 0:
+                current_success_rate = np.mean(success_history)
+                if current_success_rate <= best_success_rate + 0.02:
+                    stagnation_counter += 1
+                    if stagnation_counter >= 2:
+                        old_std = ppo_agent.action_std
+                        new_std = min(old_std + 0.1, action_std_init)
+                        ppo_agent.set_action_std(new_std)
+                        print(f"\n📉 Performance stagnated. Boosting exploration from {old_std:.2f} to {new_std:.2f}!")
+                        stagnation_counter = 0
+                else:
+                    best_success_rate = current_success_rate
+                    stagnation_counter = 0
+
+            env.save_episode_data(i_episode, current_ep_reward, env.delivered_successfully)
+            
+            # MLflow logging
+            mlflow.log_metric("episode_reward", current_ep_reward, step=i_episode)
+            mlflow.log_metric("episode_length", t, step=i_episode)
+            mlflow.log_metric("success", int(env.delivered_successfully), step=i_episode)
+            mlflow.log_metric("action_std", ppo_agent.action_std, step=i_episode)
+            if len(success_history) > 0:
+                mlflow.log_metric("success_rate_recent", np.mean(success_history), step=i_episode)
+            
+            if i_episode % 20 == 0:
+                avg_success = np.mean(list(success_history))
+                print(f"Epi: {i_episode:4d} | Timestep: {time_step:7d} | Reward: {current_ep_reward:8.2f} | Avg Success (last {len(success_history)}): {avg_success:.2%} | Action Std: {ppo_agent.action_std:.2f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+
+    print("\n🎉 Training finished!")
+    print(f"Total time taken: {datetime.now().replace(microsecond=0) - start_time}")
+    print(f"📊 MLflow server: http://127.0.0.1:5001")
+    print(f"🎛️ MLOps dashboard: http://localhost:8501") 
+    print(f"🚀 Training visualization: http://localhost:8502")
+
+if __name__ == "__main__":
+    train_ppo_agent()
